@@ -1,0 +1,13 @@
+{
+  "name": "Homely Tenants",
+  "short_name": "Homely",
+  "description": "Simple rent, electricity and payment management.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f1e8",
+  "theme_color": "#17221d",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
+
