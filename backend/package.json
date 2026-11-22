@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "build": "npm install",
     "check:env": "node scripts/check-env.js",
     "check": "node --check server.js && node --check routes/admin.js && node --check services/billing.js",
     "test": "node --test"
