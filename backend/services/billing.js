@@ -1,17 +1,13 @@
-const {
-  Tenant,
-  Room,
-  LedgerEntry,
-  Notification,
-} = require("../models");
-const {
-  dateKeyIST,
-  istDateKeyToDate,
-  addDays,
-  daysInMonth,
-  dayOfMonth,
-  isLastDayOfMonth,
-} = require("../utils/time");
+const mongoose = require("mongoose");
+const { Tenant, LedgerEntry, Notification } = require("../models");
+const { TIME_ZONE, dateKeyIST, istDateKeyToDate, addDays, daysInMonth, dayOfMonth, isLastDayOfMonth } = require("../utils/time");
+
+const rentDateFormatter = new Intl.DateTimeFormat("en-IN", {
+  timeZone: TIME_ZONE,
+  day: "numeric",
+  month: "short",
+  year: "numeric",
+});
 
 function money(value) {
   return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
@@ -25,128 +21,202 @@ function rateForDate(room, dateKey) {
   return Number(matching?.amount ?? room.monthlyRent);
 }
 
-function dailyRentAmount(room, dateKey, halfDay = false) {
+function dailyRentAmount(room, dateKey) {
   const divisor = room.type === "double" ? 2 : 1;
   const monthlyShareInPaise = Math.round((rateForDate(room, dateKey) * 100) / divisor);
   const monthDays = daysInMonth(dateKey);
   const base = Math.floor(monthlyShareInPaise / monthDays);
   const remainder = monthlyShareInPaise % monthDays;
-  const todayPaise = base + (dayOfMonth(dateKey) <= remainder ? 1 : 0);
-  return money((halfDay ? Math.round(todayPaise / 2) : todayPaise) / 100);
+  return money((base + (dayOfMonth(dateKey) <= remainder ? 1 : 0)) / 100);
 }
 
-async function balanceForTenant(tenantId) {
-  const [result] = await LedgerEntry.aggregate([
-    { $match: { tenant: tenantId } },
-    { $group: { _id: null, balance: { $sum: "$amount" } } },
+function calculateRentDue(tenant, now = new Date()) {
+  if (!tenant?.room) return { amount: 0, startAt: null, endAt: null, startDate: null, endDate: null };
+
+  const billingStart = new Date(tenant.billingStartAt || tenant.joiningAt);
+  const paidBoundary = tenant.rentPaidThrough
+    ? new Date(new Date(tenant.rentPaidThrough).getTime() + 1)
+    : billingStart;
+  const startAt = new Date(Math.max(billingStart.getTime(), paidBoundary.getTime()));
+  const todayKey = dateKeyIST(now);
+  const endOfToday = istDateKeyToDate(addDays(todayKey, 1));
+  const endExclusive = tenant.moveOutAt
+    ? new Date(Math.min(endOfToday.getTime(), new Date(tenant.moveOutAt).getTime()))
+    : endOfToday;
+
+  if (startAt >= endExclusive) {
+    return { amount: 0, startAt: null, endAt: null, startDate: null, endDate: null };
+  }
+
+  let cursor = new Date(startAt);
+  let totalPaise = 0;
+  let guard = 0;
+  while (cursor < endExclusive && guard < 3660) {
+    const dateKey = dateKeyIST(cursor);
+    const dayStart = istDateKeyToDate(dateKey);
+    const nextDay = istDateKeyToDate(addDays(dateKey, 1));
+    const segmentEnd = new Date(Math.min(nextDay.getTime(), endExclusive.getTime()));
+    const dayPaise = Math.round(dailyRentAmount(tenant.room, dateKey) * 100);
+    const fraction = (segmentEnd - cursor) / (nextDay - dayStart);
+    totalPaise += Math.round(dayPaise * fraction);
+    cursor = segmentEnd;
+    guard += 1;
+  }
+
+  const endAt = new Date(endExclusive.getTime() - 1);
+  return {
+    amount: totalPaise / 100,
+    startAt,
+    endAt,
+    startDate: dateKeyIST(startAt),
+    endDate: dateKeyIST(endAt),
+  };
+}
+
+function objectId(value) {
+  return value instanceof mongoose.Types.ObjectId ? value : new mongoose.Types.ObjectId(String(value));
+}
+
+function countedLedgerMatch(tenantId) {
+  return {
+    tenant: objectId(tenantId),
+    $nor: [
+      { category: "rent", source: "cron" },
+      { category: "rent", kind: "payment", "metadata.storedRentOffset": { $ne: true } },
+    ],
+  };
+}
+
+async function storedCategoryBalances(tenantId) {
+  const totals = await LedgerEntry.aggregate([
+    { $match: countedLedgerMatch(tenantId) },
+    { $group: { _id: "$category", amount: { $sum: "$amount" } } },
   ]);
-  return money(result?.balance || 0);
+  return Object.fromEntries(totals.map((item) => [item._id, money(item.amount)]));
+}
+
+async function financialSummaryForTenant(tenantOrId, now = new Date()) {
+  const tenant = tenantOrId?.room?.monthlyRent != null
+    ? tenantOrId
+    : await Tenant.findById(tenantOrId?._id || tenantOrId).populate("room");
+  if (!tenant) throw Object.assign(new Error("Tenant not found"), { status: 404 });
+
+  const stored = await storedCategoryBalances(tenant._id);
+  const liveRent = calculateRentDue(tenant, now);
+  const categories = {
+    rent: money((stored.rent || 0) + liveRent.amount),
+    electricity: money(stored.electricity || 0),
+    general: money(stored.general || 0),
+  };
+  const balance = money(Object.values(categories).reduce((sum, amount) => sum + amount, 0));
+  return { balance, categories, liveRent };
+}
+
+async function balanceForTenant(tenantOrId, now = new Date()) {
+  return (await financialSummaryForTenant(tenantOrId, now)).balance;
+}
+
+function liveRentLedgerEntry(tenant, liveRent) {
+  if (!(liveRent.amount > 0)) return null;
+  return {
+    _id: `live-rent:${tenant._id}:${liveRent.endDate}`,
+    tenant: tenant._id,
+    room: tenant.room?._id || tenant.room,
+    kind: "charge",
+    category: "rent",
+    amount: liveRent.amount,
+    description: `Rent due: ${rentDateFormatter.format(liveRent.startAt)} – ${rentDateFormatter.format(liveRent.endAt)}`,
+    effectiveAt: liveRent.endAt,
+    source: "system",
+    virtual: true,
+    metadata: { live: true, startDate: liveRent.startDate, endDate: liveRent.endDate },
+  };
+}
+
+async function ledgerForTenant(tenantOrId, { now = new Date(), includeTenant = false, limit = 500 } = {}) {
+  const tenant = tenantOrId?.room?.monthlyRent != null
+    ? tenantOrId
+    : await Tenant.findById(tenantOrId?._id || tenantOrId).populate("room");
+  if (!tenant) throw Object.assign(new Error("Tenant not found"), { status: 404 });
+
+  const [stored, summary] = await Promise.all([
+    LedgerEntry.find(countedLedgerMatch(tenant._id))
+      .sort({ effectiveAt: -1, createdAt: -1 })
+      .limit(Math.max(0, limit - 1))
+      .populate("room", "name")
+      .populate("tenant", "name phone")
+      .lean(),
+    financialSummaryForTenant(tenant, now),
+  ]);
+  const live = liveRentLedgerEntry(tenant, summary.liveRent);
+  if (live && includeTenant) live.tenant = { _id: tenant._id, name: tenant.name, phone: tenant.phone };
+  return [...(live ? [live] : []), ...stored].sort((a, b) => new Date(b.effectiveAt) - new Date(a.effectiveAt));
+}
+
+async function storedRentBalanceForTenant(tenantId) {
+  return (await storedCategoryBalances(tenantId)).rent || 0;
 }
 
 async function advancePaidThrough(tenant, room, rentAmount) {
   let remainingPaise = Math.round(Number(rentAmount) * 100);
-  let cursor = new Date(tenant.rentPaidThrough || tenant.joiningAt);
+  if (remainingPaise <= 0) return tenant.rentPaidThrough;
+
+  const billingStart = new Date(tenant.billingStartAt || tenant.joiningAt);
+  const paidBoundary = tenant.rentPaidThrough
+    ? new Date(new Date(tenant.rentPaidThrough).getTime() + 1)
+    : billingStart;
+  let cursor = new Date(Math.max(billingStart.getTime(), paidBoundary.getTime()));
   let guard = 0;
 
   while (remainingPaise > 0 && guard < 3660) {
-    const key = dateKeyIST(cursor);
-    const start = istDateKeyToDate(key);
-    const next = istDateKeyToDate(addDays(key, 1));
-    const dayPaise = Math.round(dailyRentAmount(room, key) * 100);
-    const remainingFraction = Math.max(0, (next - cursor) / (next - start));
+    const dateKey = dateKeyIST(cursor);
+    const dayStart = istDateKeyToDate(dateKey);
+    const nextDay = istDateKeyToDate(addDays(dateKey, 1));
+    const dayPaise = Math.round(dailyRentAmount(room, dateKey) * 100);
+    const remainingFraction = (nextDay - cursor) / (nextDay - dayStart);
     const remainingDayPaise = Math.max(1, Math.round(dayPaise * remainingFraction));
 
     if (remainingPaise >= remainingDayPaise) {
       remainingPaise -= remainingDayPaise;
-      cursor = next;
+      cursor = nextDay;
     } else {
-      const advanceMs = (remainingPaise / dayPaise) * (next - start);
-      cursor = new Date(cursor.getTime() + advanceMs);
+      cursor = new Date(cursor.getTime() + (remainingPaise / dayPaise) * (nextDay - dayStart));
       remainingPaise = 0;
     }
     guard += 1;
   }
 
-  return cursor;
+  return new Date(cursor.getTime() - 1);
 }
 
-async function createMonthEndNotifications(dateKey) {
-  if (!isLastDayOfMonth(dateKey)) return 0;
-  const tenants = await Tenant.find({ status: "active" }).select("_id");
-  let created = 0;
-
-  for (const tenant of tenants) {
-    try {
-      await Notification.create({
-        tenant: tenant._id,
+async function ensureMonthEndNotification(tenantId, now = new Date()) {
+  const dateKey = dateKeyIST(now);
+  if (!isLastDayOfMonth(dateKey)) return null;
+  const uniqueKey = `month-end:${tenantId}:${dateKey.slice(0, 7)}`;
+  return Notification.findOneAndUpdate(
+    { uniqueKey },
+    {
+      $setOnInsert: {
+        tenant: tenantId,
         type: "month_end",
         title: "Month-end update",
         message: "Your month-end rent summary is ready. Open your ledger to review the latest balance.",
-        uniqueKey: `month-end:${tenant._id}:${dateKey.slice(0, 7)}`,
-      });
-      created += 1;
-    } catch (error) {
-      if (error?.code !== 11000) throw error;
-    }
-  }
-  return created;
-}
-
-async function runDailyBilling(now = new Date()) {
-  const todayKey = dateKeyIST(now);
-  const tenants = await Tenant.find({ status: { $in: ["active", "moved_out"] } }).populate("room");
-  let chargesCreated = 0;
-  let tenantsChecked = 0;
-
-  for (const tenant of tenants) {
-    if (!tenant.room) continue;
-    const startKey = dateKeyIST(tenant.billingStartAt || tenant.joiningAt);
-    const moveOutKey = tenant.moveOutAt ? dateKeyIST(tenant.moveOutAt) : null;
-    const lastCharge = await LedgerEntry.findOne({
-      tenant: tenant._id,
-      category: "rent",
-      source: "cron",
-      "metadata.dateKey": { $exists: true },
-    }).sort({ effectiveAt: -1 });
-    let key = lastCharge?.metadata?.dateKey ? addDays(lastCharge.metadata.dateKey, 1) : startKey;
-    let guard = 0;
-
-    while (key <= todayKey && (!moveOutKey || key <= moveOutKey) && guard < 3660) {
-      const halfDay = Boolean(moveOutKey && key === moveOutKey);
-      const amount = dailyRentAmount(tenant.room, key, halfDay);
-      try {
-        await LedgerEntry.create({
-          tenant: tenant._id,
-          room: tenant.room._id,
-          kind: "charge",
-          category: "rent",
-          amount,
-          description: halfDay ? `Half-day rent for ${key}` : `Daily rent for ${key}`,
-          effectiveAt: istDateKeyToDate(key),
-          source: "cron",
-          uniqueKey: `rent:${tenant._id}:${key}`,
-          metadata: { dateKey: key, halfDay, monthlyRate: rateForDate(tenant.room, key) },
-        });
-        chargesCreated += 1;
-      } catch (error) {
-        if (error?.code !== 11000) throw error;
-      }
-      key = addDays(key, 1);
-      guard += 1;
-    }
-    tenantsChecked += 1;
-  }
-
-  const notificationsCreated = await createMonthEndNotifications(todayKey);
-  return { dateKey: todayKey, tenantsChecked, chargesCreated, notificationsCreated };
+        uniqueKey,
+      },
+    },
+    { new: true, upsert: true },
+  );
 }
 
 module.exports = {
   money,
   rateForDate,
   dailyRentAmount,
+  calculateRentDue,
+  financialSummaryForTenant,
   balanceForTenant,
+  ledgerForTenant,
+  storedRentBalanceForTenant,
   advancePaidThrough,
-  runDailyBilling,
+  ensureMonthEndNotification,
 };
-

@@ -1,14 +1,17 @@
 const express = require("express");
 const {
   Tenant,
-  LedgerEntry,
   Payment,
   MeterReading,
   AuditLog,
   Notification,
 } = require("../models");
 const { authenticate, requireRole } = require("../middleware/auth");
-const { money } = require("../services/billing");
+const {
+  financialSummaryForTenant,
+  ledgerForTenant,
+  ensureMonthEndNotification,
+} = require("../services/billing");
 
 const router = express.Router();
 router.use(authenticate, requireRole("tenant"));
@@ -23,27 +26,25 @@ function selectedTenantId(req) {
 }
 
 async function currentTenant(req) {
-  return Tenant.findById(selectedTenantId(req)).populate("room", "name type monthlyRent");
+  return Tenant.findById(selectedTenantId(req)).populate("room", "name type monthlyRent rentHistory");
 }
 
 router.get("/dashboard", async (req, res, next) => {
   try {
     const tenant = await currentTenant(req);
     if (!tenant) return res.status(404).json({ message: "Tenant profile not found" });
-    const [totals, latestPayment, latestReading, unreadNotifications] = await Promise.all([
-      LedgerEntry.aggregate([
-        { $match: { tenant: tenant._id } },
-        { $group: { _id: "$category", amount: { $sum: "$amount" } } },
-      ]),
+    await ensureMonthEndNotification(tenant._id);
+    const [summary, latestPayment, latestReading, unreadNotifications] = await Promise.all([
+      financialSummaryForTenant(tenant),
       Payment.findOne({ tenant: tenant._id }).sort({ paidAt: -1 }),
       MeterReading.findOne({ room: tenant.room._id }).sort({ readAt: -1 }),
       Notification.countDocuments({ tenant: tenant._id, readAt: null }),
     ]);
-    const categories = Object.fromEntries(totals.map((item) => [item._id, money(item.amount)]));
     res.json({
       tenant,
-      balance: money(Object.values(categories).reduce((sum, value) => sum + value, 0)),
-      categories,
+      balance: summary.balance,
+      categories: summary.categories,
+      liveRent: summary.liveRent,
       latestPayment,
       latestReading,
       unreadNotifications,
@@ -55,7 +56,7 @@ router.get("/dashboard", async (req, res, next) => {
 
 router.get("/ledger", async (req, res, next) => {
   try {
-    res.json(await LedgerEntry.find({ tenant: selectedTenantId(req) }).sort({ effectiveAt: -1, createdAt: -1 }).limit(500).populate("room", "name"));
+    res.json(await ledgerForTenant(selectedTenantId(req)));
   } catch (error) {
     next(error);
   }
@@ -89,7 +90,9 @@ router.get("/audit-logs", async (req, res, next) => {
 
 router.get("/notifications", async (req, res, next) => {
   try {
-    res.json(await Notification.find({ tenant: selectedTenantId(req) }).sort({ createdAt: -1 }).limit(100));
+    const tenantId = selectedTenantId(req);
+    await ensureMonthEndNotification(tenantId);
+    res.json(await Notification.find({ tenant: tenantId }).sort({ createdAt: -1 }).limit(100));
   } catch (error) {
     next(error);
   }

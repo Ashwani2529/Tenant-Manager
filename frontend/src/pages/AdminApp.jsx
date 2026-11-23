@@ -65,6 +65,18 @@ export default function AdminApp({ user, theme, setTheme, onLogout }) {
     return () => clearTimeout(timer)
   }, [])
 
+  useEffect(() => {
+    let currentDate = today()
+    const timer = setInterval(() => {
+      const nextDate = today()
+      if (nextDate !== currentDate) {
+        currentDate = nextDate
+        refresh(true)
+      }
+    }, 60_000)
+    return () => clearInterval(timer)
+  }, [])
+
   async function submit(path, options, success) {
     await api(path, options)
     setModal(null)
@@ -118,7 +130,7 @@ function Dashboard({ data, setPage, setModal }) {
       <StatCard label="Outstanding balance" value={inr.format(data.totalDue || 0)} detail="Across all tenant accounts" tone="coral" icon="wallet" />
       <StatCard label="Active tenants" value={data.activeTenants || 0} detail="Currently living on property" tone="green" icon="users" />
       <StatCard label="Active rooms" value={data.activeRooms || 0} detail="Single and double rooms" tone="violet" icon="rooms" />
-      <StatCard label="System status" value="On track" detail="Daily recovery protection active" tone="blue" icon="check" />
+      <StatCard label="System status" value="Live" detail="Rent is calculated from today’s date" tone="blue" icon="check" />
     </section>
     <section className="split-grid">
       <div className="panel"><div className="panel-head"><div><span className="eyebrow">RECENT ACTIVITY</span><h3>Latest payments</h3></div><button className="text-button" onClick={() => setPage('payments')}>View all <Icon name="arrow" size={16} /></button></div>
@@ -158,16 +170,16 @@ function Payments({ payments, tenants, setModal }) {
 function Ledger({ entries, tenants, setModal }) {
   const [filter, setFilter] = useState('')
   const visible = filter ? entries.filter((entry) => entry.tenant?._id === filter) : entries
-  return <div className="page-stack printable"><div className="section-toolbar"><div><h2>Billing ledger</h2><p>Daily rent, electricity, payments and audited corrections.</p></div><div className="toolbar-actions"><button className="soft-button" onClick={() => window.print()}><Icon name="print" />Print statement</button><button className="primary-button" onClick={() => setModal({ type: 'adjustment' })}><Icon name="plus" />Adjustment</button></div></div>
+  return <div className="page-stack printable"><div className="section-toolbar"><div><h2>Billing ledger</h2><p>Live rent due, electricity, payments and audited corrections.</p></div><div className="toolbar-actions"><button className="soft-button" onClick={() => window.print()}><Icon name="print" />Print statement</button><button className="primary-button" onClick={() => setModal({ type: 'adjustment' })}><Icon name="plus" />Adjustment</button></div></div>
     <div className="filter-bar"><select value={filter} onChange={(e) => setFilter(e.target.value)}><option value="">All tenants</option>{tenants.map((tenant) => <option value={tenant._id} key={tenant._id}>{tenant.name}</option>)}</select><span>{visible.length} entries</span></div>
-    {visible.length ? <div className="ledger-list">{visible.map((entry) => <article className="ledger-row" key={entry._id}><span className={`entry-dot ${entry.amount < 0 ? 'credit' : entry.category}`} /><div><strong>{entry.description}</strong><small>{entry.tenant?.name} · {dateTime.format(new Date(entry.effectiveAt))}</small></div><span className="category-chip">{entry.category}</span><b className={entry.amount < 0 ? 'clear' : 'due'}>{entry.amount < 0 ? '−' : '+'}{inr.format(Math.abs(entry.amount))}</b></article>)}</div> : <EmptyState icon="ledger" title="No ledger entries" text="Daily rent appears after the first billing run." />}
+    {visible.length ? <div className="ledger-list">{visible.map((entry) => <article className="ledger-row" key={entry._id}><span className={`entry-dot ${entry.amount < 0 ? 'credit' : entry.category}`} /><div><strong>{entry.description}</strong><small>{entry.tenant?.name} · {dateTime.format(new Date(entry.effectiveAt))}</small></div><span className="category-chip">{entry.category}</span><b className={entry.amount < 0 ? 'clear' : 'due'}>{entry.amount < 0 ? '−' : '+'}{inr.format(Math.abs(entry.amount))}</b></article>)}</div> : <EmptyState icon="ledger" title="No ledger entries" text="Live rent appears when a tenant has unpaid days." />}
   </div>
 }
 
 function Settings({ config, rooms, setModal }) {
   return <div className="page-stack"><div className="section-toolbar"><div><h2>Property configuration</h2><p>Global details and the electricity price used for future units.</p></div><button className="primary-button" onClick={() => setModal({ type: 'settings' })}><Icon name="edit" />Edit configuration</button></div>
-    <section className="settings-grid"><article className="settings-card"><span className="activity-icon violet"><Icon name="home" /></span><small>Property name</small><h3>{config.propertyName}</h3><p>Shown throughout the tenant experience.</p></article><article className="settings-card"><span className="activity-icon amber"><Icon name="bolt" /></span><small>Electricity price</small><h3>{inr.format(config.electricityPrice || 0)} <em>/ unit</em></h3><p>A current reading is required before changing this rate.</p></article><article className="settings-card"><span className="activity-icon blue"><Icon name="history" /></span><small>Local time</small><h3>Asia / Kolkata</h3><p>Daily billing runs at midnight IST.</p></article></section>
-    <section className="info-panel"><Icon name="check" /><div><strong>Missed-job recovery is enabled</strong><p>The daily endpoint can run more than once safely. It only creates rent entries that are missing.</p></div></section>
+    <section className="settings-grid"><article className="settings-card"><span className="activity-icon violet"><Icon name="home" /></span><small>Property name</small><h3>{config.propertyName}</h3><p>Shown throughout the tenant experience.</p></article><article className="settings-card"><span className="activity-icon amber"><Icon name="bolt" /></span><small>Electricity price</small><h3>{inr.format(config.electricityPrice || 0)} <em>/ unit</em></h3><p>A current reading is required before changing this rate.</p></article><article className="settings-card"><span className="activity-icon blue"><Icon name="history" /></span><small>Local time</small><h3>Asia / Kolkata</h3><p>The current IST date drives live rent totals.</p></article></section>
+    <section className="info-panel"><Icon name="check" /><div><strong>Live rent calculation is enabled</strong><p>No scheduled job is required. Unpaid rent is recalculated whenever account data is opened.</p></div></section>
     <div className="panel"><div className="panel-head"><div><span className="eyebrow">ROOM PRICING</span><h3>Monthly rent by room</h3></div></div><div className="compact-list">{rooms.map((room) => <div key={room._id}><span>{room.name}<small>{room.type}</small></span><strong>{inr.format(room.monthlyRent)}</strong></div>)}</div></div>
   </div>
 }

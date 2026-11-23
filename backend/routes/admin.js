@@ -15,10 +15,12 @@ const { hashPassword, normalizePhone, isValidPhone } = require("../utils/securit
 const { dateKeyIST, istDateKeyToDate } = require("../utils/time");
 const {
   money,
-  dailyRentAmount,
+  financialSummaryForTenant,
   balanceForTenant,
+  ledgerForTenant,
+  storedRentBalanceForTenant,
   advancePaidThrough,
-  runDailyBilling,
+  ensureMonthEndNotification,
 } = require("../services/billing");
 
 const router = express.Router();
@@ -51,6 +53,12 @@ function dateInput(value, fallback = new Date()) {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) throw new Error("Invalid date");
   return parsed;
+}
+
+function paidThroughInput(value, fallback = new Date()) {
+  if (!value) return fallback;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return istDateKeyToDate(value, "23:59:59.999");
+  return dateInput(value, fallback);
 }
 
 async function config() {
@@ -141,21 +149,18 @@ async function recordMeterReading({ roomId, units, readAt, isOpening, actor }) {
 
 router.get("/dashboard", async (_req, res, next) => {
   try {
-    const [activeTenants, activeRooms, balances, recentPayments, recentReadings] = await Promise.all([
-      Tenant.countDocuments({ status: "active" }),
+    const [tenants, activeRooms, recentPayments, recentReadings] = await Promise.all([
+      Tenant.find({ status: "active" }).populate("room"),
       Room.countDocuments({ active: true }),
-      LedgerEntry.aggregate([
-        { $group: { _id: "$tenant", balance: { $sum: "$amount" } } },
-        { $match: { balance: { $gt: 0 } } },
-        { $group: { _id: null, total: { $sum: "$balance" } } },
-      ]),
       Payment.find().sort({ paidAt: -1 }).limit(5).populate("tenant", "name phone"),
       MeterReading.find().sort({ readAt: -1 }).limit(5).populate("room", "name"),
     ]);
+    const summaries = await Promise.all(tenants.map((tenant) => financialSummaryForTenant(tenant)));
+    await Promise.all(tenants.map((tenant) => ensureMonthEndNotification(tenant._id)));
     res.json({
-      activeTenants,
+      activeTenants: tenants.length,
       activeRooms,
-      totalDue: money(Math.max(0, balances[0]?.total || 0)),
+      totalDue: money(summaries.reduce((sum, item) => sum + Math.max(0, item.balance), 0)),
       recentPayments,
       recentReadings,
     });
@@ -243,10 +248,9 @@ router.delete("/rooms/:id", async (req, res, next) => {
 
 router.get("/tenants", async (_req, res, next) => {
   try {
-    const tenants = await Tenant.find().sort({ status: 1, name: 1 }).populate("room", "name type monthlyRent").lean();
-    const balances = await LedgerEntry.aggregate([{ $group: { _id: "$tenant", balance: { $sum: "$amount" } } }]);
-    const byTenant = new Map(balances.map((item) => [String(item._id), money(item.balance)]));
-    res.json(tenants.map((tenant) => ({ ...tenant, balance: byTenant.get(String(tenant._id)) || 0 })));
+    const tenants = await Tenant.find().sort({ status: 1, name: 1 }).populate("room");
+    const summaries = await Promise.all(tenants.map((tenant) => financialSummaryForTenant(tenant)));
+    res.json(tenants.map((tenant, index) => ({ ...tenant.toObject(), balance: summaries[index].balance })));
   } catch (error) {
     next(error);
   }
@@ -267,7 +271,7 @@ router.post("/tenants", async (req, res, next) => {
 
     const joiningAt = dateInput(req.body.joiningAt);
     const billingStartAt = dateInput(req.body.billingStartAt, joiningAt);
-    const paidThrough = dateInput(req.body.rentPaidThrough, joiningAt);
+    const paidThrough = paidThroughInput(req.body.rentPaidThrough, joiningAt);
     user = await User.create({ role: "tenant", name: req.body.name.trim(), phone, passwordHash: await hashPassword(req.body.password) });
     const tenant = await Tenant.create({ user: user._id, room: room._id, name: user.name, phone, joiningAt, billingStartAt, rentPaidThrough: paidThrough });
     user.tenants = [tenant._id];
@@ -304,9 +308,10 @@ router.patch("/tenants/:id", async (req, res, next) => {
       tenant.phone = user.phone = phone;
       if (sharedAccount) await Tenant.updateMany({ user: user._id, _id: { $ne: tenant._id } }, { phone });
     }
-    for (const field of ["joiningAt", "billingStartAt", "rentPaidThrough"]) {
+    for (const field of ["joiningAt", "billingStartAt"]) {
       if (req.body[field] != null) tenant[field] = dateInput(req.body[field]);
     }
+    if (req.body.rentPaidThrough != null) tenant.rentPaidThrough = paidThroughInput(req.body.rentPaidThrough);
     await Promise.all([tenant.save(), user.save()]);
     await audit({ actor: req.user._id, tenant: tenant._id, entityType: "tenant", entityId: tenant._id, action: "updated", reason, changes: objectChanges(before, tenant, ["name", "phone", "joiningAt", "billingStartAt", "rentPaidThrough"]) });
     res.json(await tenant.populate("room", "name type monthlyRent"));
@@ -337,12 +342,6 @@ router.post("/tenants/:id/archive", async (req, res, next) => {
     if (!tenant) return res.status(404).json({ message: "Tenant not found" });
     const moveOutKey = String(req.body.moveOutDate || dateKeyIST()).slice(0, 10);
     const moveOutAt = istDateKeyToDate(moveOutKey, "12:00:00.000");
-    const fullCharge = await LedgerEntry.findOne({ uniqueKey: `rent:${tenant._id}:${moveOutKey}` });
-    if (fullCharge && !fullCharge.metadata?.halfDay) {
-      const halfAmount = dailyRentAmount(tenant.room, moveOutKey, true);
-      const correction = money(halfAmount - fullCharge.amount);
-      await LedgerEntry.create({ tenant: tenant._id, room: tenant.room._id, kind: "adjustment", category: "rent", amount: correction, description: `Half-day move-out correction for ${moveOutKey}`, effectiveAt: moveOutAt, source: "admin", uniqueKey: `moveout:${tenant._id}:${moveOutKey}`, createdBy: req.user._id, metadata: { reason } });
-    }
     tenant.status = "moved_out";
     tenant.moveOutAt = moveOutAt;
     await tenant.save();
@@ -357,8 +356,10 @@ router.post("/tenants/:id/archive", async (req, res, next) => {
 
 router.get("/ledger", async (req, res, next) => {
   try {
-    const query = req.query.tenant ? { tenant: req.query.tenant } : {};
-    res.json(await LedgerEntry.find(query).sort({ effectiveAt: -1, createdAt: -1 }).limit(500).populate("tenant", "name phone").populate("room", "name"));
+    const query = req.query.tenant ? { _id: req.query.tenant } : {};
+    const tenants = await Tenant.find(query).populate("room");
+    const entries = (await Promise.all(tenants.map((tenant) => ledgerForTenant(tenant, { includeTenant: true })))).flat();
+    res.json(entries.sort((a, b) => new Date(b.effectiveAt) - new Date(a.effectiveAt)).slice(0, 500));
   } catch (error) {
     next(error);
   }
@@ -399,16 +400,35 @@ router.post("/payments", async (req, res, next) => {
     const paidAt = dateInput(req.body.paidAt);
     const payment = await Payment.create({ tenant: tenant._id, totalAmount, rentAmount, electricityAmount, paidAt, note: req.body.note, createdBy: req.user._id });
     if (rentAmount > 0) {
-      await LedgerEntry.create({ tenant: tenant._id, room: tenant.room._id, kind: "payment", category: "rent", amount: -rentAmount, description: "Rent payment received", effectiveAt: paidAt, source: "admin", uniqueKey: `payment:${payment._id}:rent`, createdBy: req.user._id });
-      tenant.rentPaidThrough = await advancePaidThrough(tenant, tenant.room, rentAmount);
-      await tenant.save();
+      const storedRentDue = Math.max(0, await storedRentBalanceForTenant(tenant._id));
+      const storedRentOffset = money(Math.min(rentAmount, storedRentDue));
+      const amountForPaidThrough = money(rentAmount - storedRentOffset);
+      if (storedRentOffset > 0) {
+        await LedgerEntry.create({
+          tenant: tenant._id,
+          room: tenant.room._id,
+          kind: "payment",
+          category: "rent",
+          amount: -storedRentOffset,
+          description: "Rent balance payment received",
+          effectiveAt: paidAt,
+          source: "admin",
+          uniqueKey: `payment:${payment._id}:rent-balance`,
+          createdBy: req.user._id,
+          metadata: { storedRentOffset: true },
+        });
+      }
+      if (amountForPaidThrough > 0) {
+        tenant.rentPaidThrough = await advancePaidThrough(tenant, tenant.room, amountForPaidThrough);
+        await tenant.save();
+      }
     }
     if (electricityAmount > 0) {
       await LedgerEntry.create({ tenant: tenant._id, room: tenant.room._id, kind: "payment", category: "electricity", amount: -electricityAmount, description: "Electricity payment received", effectiveAt: paidAt, source: "admin", uniqueKey: `payment:${payment._id}:electricity`, createdBy: req.user._id });
     }
     await Notification.create({ tenant: tenant._id, type: "payment", title: "Payment received", message: `We recorded your payment of ₹${totalAmount.toFixed(2)}. Thank you.`, uniqueKey: `payment-notification:${payment._id}` });
     await audit({ actor: req.user._id, tenant: tenant._id, entityType: "payment", entityId: payment._id, action: "created", reason: req.body.note || "Payment received", changes: { totalAmount, rentAmount, electricityAmount, rentPaidThrough: tenant.rentPaidThrough } });
-    res.status(201).json({ payment, rentPaidThrough: tenant.rentPaidThrough, balance: await balanceForTenant(tenant._id) });
+    res.status(201).json({ payment, rentPaidThrough: tenant.rentPaidThrough, balance: await balanceForTenant(tenant) });
   } catch (error) {
     next(error);
   }
@@ -476,14 +496,6 @@ router.get("/audit-logs", async (req, res, next) => {
   try {
     const query = req.query.tenant ? { tenant: req.query.tenant } : {};
     res.json(await AuditLog.find(query).sort({ createdAt: -1 }).limit(500).populate("actor", "name").populate("tenant", "name phone"));
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.post("/run-billing", async (_req, res, next) => {
-  try {
-    res.json(await runDailyBilling());
   } catch (error) {
     next(error);
   }

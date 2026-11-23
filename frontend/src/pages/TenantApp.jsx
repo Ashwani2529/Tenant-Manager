@@ -15,6 +15,7 @@ const nav = [
 const inr = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 })
 const dateTime = new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Kolkata' })
 const dateOnly = new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeZone: 'Asia/Kolkata' })
+const currentDateIST = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date())
 
 export default function TenantApp({ user, theme, setTheme, onLogout }) {
   const profiles = user.tenants?.length ? user.tenants : user.tenant ? [user.tenant] : []
@@ -42,6 +43,18 @@ export default function TenantApp({ user, theme, setTheme, onLogout }) {
   useEffect(() => {
     const timer = setTimeout(() => refresh(selectedTenant), 0)
     return () => clearTimeout(timer)
+  }, [selectedTenant])
+
+  useEffect(() => {
+    let currentDate = currentDateIST()
+    const timer = setInterval(() => {
+      const nextDate = currentDateIST()
+      if (nextDate !== currentDate) {
+        currentDate = nextDate
+        refresh(selectedTenant)
+      }
+    }, 60_000)
+    return () => clearInterval(timer)
   }, [selectedTenant])
 
   function changeProfile(tenantId) {
