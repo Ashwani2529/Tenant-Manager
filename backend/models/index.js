@@ -9,7 +9,7 @@ const userSchema = new Schema(
     name: { type: String, required: true, trim: true },
     phone: { type: String, required: true, unique: true, trim: true },
     passwordHash: { type: String, required: true, select: false },
-    tenant: { type: Schema.Types.ObjectId, ref: "Tenant", default: null },
+    tenants: { type: [{ type: Schema.Types.ObjectId, ref: "Tenant" }], default: [] },
     active: { type: Boolean, default: true },
     lastLoginAt: Date,
   },
@@ -37,10 +37,10 @@ const roomSchema = new Schema(
 
 const tenantSchema = new Schema(
   {
-    user: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    user: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     room: { type: Schema.Types.ObjectId, ref: "Room", required: true },
     name: { type: String, required: true, trim: true },
-    phone: { type: String, required: true, unique: true, trim: true },
+    phone: { type: String, required: true, trim: true },
     joiningAt: { type: Date, required: true },
     billingStartAt: { type: Date, required: true },
     moveOutAt: { type: Date, default: null },
@@ -61,6 +61,7 @@ const configurationSchema = new Schema(
       type: [new Schema({ price: Number, effectiveFrom: Date }, { _id: false })],
       default: [],
     },
+    initialDataSeededAt: { type: Date, default: null },
   },
   { timestamps: true },
 );

@@ -12,6 +12,24 @@ const {
 const router = express.Router();
 const attempts = new Map();
 
+async function tenantProfiles(user) {
+  if (user.role !== "tenant" || !user.tenants?.length) return [];
+  const profiles = await Tenant.find({ _id: { $in: user.tenants } }).populate("room", "name type monthlyRent");
+  const byId = new Map(profiles.map((tenant) => [String(tenant._id), tenant]));
+  return user.tenants.map((id) => byId.get(String(id))).filter(Boolean);
+}
+
+function publicUser(user, tenants = []) {
+  return {
+    id: user._id,
+    name: user.name,
+    phone: user.phone,
+    role: user.role,
+    tenant: tenants[0] || null,
+    tenants,
+  };
+}
+
 router.get("/status", async (_req, res, next) => {
   try {
     const bootstrapRequired = !(await User.exists({ role: "admin" }));
@@ -66,9 +84,10 @@ router.post("/login", async (req, res, next) => {
     user.lastLoginAt = new Date();
     await user.save();
     const token = signToken({ sub: user._id.toString(), role: user.role }, process.env.JWT_SECRET);
+    const tenants = await tenantProfiles(user);
     res.json({
       token,
-      user: { id: user._id, name: user.name, phone: user.phone, role: user.role, tenant: user.tenant },
+      user: publicUser(user, tenants),
     });
   } catch (error) {
     next(error);
@@ -77,15 +96,9 @@ router.post("/login", async (req, res, next) => {
 
 router.get("/me", authenticate, async (req, res, next) => {
   try {
-    const tenant = req.user.tenant ? await Tenant.findById(req.user.tenant).populate("room") : null;
+    const tenants = await tenantProfiles(req.user);
     res.json({
-      user: {
-        id: req.user._id,
-        name: req.user.name,
-        phone: req.user.phone,
-        role: req.user.role,
-        tenant,
-      },
+      user: publicUser(req.user, tenants),
     });
   } catch (error) {
     next(error);

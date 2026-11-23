@@ -6,7 +6,10 @@ const router = express.Router();
 
 function authorizeCron(req, res, next) {
   if (!process.env.CRON_SECRET) return res.status(503).json({ message: "CRON_SECRET is not configured" });
-  if (req.get("x-cron-secret") !== process.env.CRON_SECRET) {
+  const authorization = req.get("authorization") || "";
+  const bearerToken = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  const suppliedSecret = bearerToken || req.get("x-cron-secret");
+  if (suppliedSecret !== process.env.CRON_SECRET) {
     return res.status(401).json({ message: "Invalid cron secret" });
   }
   next();

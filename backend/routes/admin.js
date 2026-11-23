@@ -270,7 +270,7 @@ router.post("/tenants", async (req, res, next) => {
     const paidThrough = dateInput(req.body.rentPaidThrough, joiningAt);
     user = await User.create({ role: "tenant", name: req.body.name.trim(), phone, passwordHash: await hashPassword(req.body.password) });
     const tenant = await Tenant.create({ user: user._id, room: room._id, name: user.name, phone, joiningAt, billingStartAt, rentPaidThrough: paidThrough });
-    user.tenant = tenant._id;
+    user.tenants = [tenant._id];
     await user.save();
 
     const openingBalance = Number(req.body.openingBalance || 0);
@@ -293,11 +293,16 @@ router.patch("/tenants/:id", async (req, res, next) => {
     if (!tenant) return res.status(404).json({ message: "Tenant not found" });
     const user = await User.findById(tenant.user);
     const before = tenant.toObject();
-    if (req.body.name != null) tenant.name = user.name = String(req.body.name).trim();
+    const sharedAccount = user.tenants.length > 1;
+    if (req.body.name != null) {
+      tenant.name = String(req.body.name).trim();
+      if (!sharedAccount) user.name = tenant.name;
+    }
     if (req.body.phone != null) {
       const phone = normalizePhone(req.body.phone);
       if (!isValidPhone(phone)) return res.status(400).json({ message: "Enter a valid 10-digit phone number" });
       tenant.phone = user.phone = phone;
+      if (sharedAccount) await Tenant.updateMany({ user: user._id, _id: { $ne: tenant._id } }, { phone });
     }
     for (const field of ["joiningAt", "billingStartAt", "rentPaidThrough"]) {
       if (req.body[field] != null) tenant[field] = dateInput(req.body[field]);
@@ -341,7 +346,8 @@ router.post("/tenants/:id/archive", async (req, res, next) => {
     tenant.status = "moved_out";
     tenant.moveOutAt = moveOutAt;
     await tenant.save();
-    await User.findByIdAndUpdate(tenant.user, { active: false });
+    const hasAnotherActiveProfile = await Tenant.exists({ user: tenant.user, status: "active", _id: { $ne: tenant._id } });
+    if (!hasAnotherActiveProfile) await User.findByIdAndUpdate(tenant.user, { active: false });
     await audit({ actor: req.user._id, tenant: tenant._id, entityType: "tenant", entityId: tenant._id, action: "archived", reason, changes: { status: { from: "active", to: "moved_out" }, moveOutAt } });
     res.json(tenant);
   } catch (error) {

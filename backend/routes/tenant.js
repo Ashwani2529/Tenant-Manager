@@ -13,8 +13,17 @@ const { money } = require("../services/billing");
 const router = express.Router();
 router.use(authenticate, requireRole("tenant"));
 
+function selectedTenantId(req) {
+  const allowed = (req.user.tenants || []).map(String);
+  const requested = String(req.query.tenant || req.get("x-tenant-id") || allowed[0] || "");
+  if (!requested || !allowed.includes(requested)) {
+    throw Object.assign(new Error("You do not have access to that tenant profile"), { status: 403 });
+  }
+  return requested;
+}
+
 async function currentTenant(req) {
-  return Tenant.findById(req.user.tenant).populate("room", "name type monthlyRent");
+  return Tenant.findById(selectedTenantId(req)).populate("room", "name type monthlyRent");
 }
 
 router.get("/dashboard", async (req, res, next) => {
@@ -46,7 +55,7 @@ router.get("/dashboard", async (req, res, next) => {
 
 router.get("/ledger", async (req, res, next) => {
   try {
-    res.json(await LedgerEntry.find({ tenant: req.user.tenant }).sort({ effectiveAt: -1, createdAt: -1 }).limit(500).populate("room", "name"));
+    res.json(await LedgerEntry.find({ tenant: selectedTenantId(req) }).sort({ effectiveAt: -1, createdAt: -1 }).limit(500).populate("room", "name"));
   } catch (error) {
     next(error);
   }
@@ -54,7 +63,7 @@ router.get("/ledger", async (req, res, next) => {
 
 router.get("/payments", async (req, res, next) => {
   try {
-    res.json(await Payment.find({ tenant: req.user.tenant }).sort({ paidAt: -1 }).limit(300));
+    res.json(await Payment.find({ tenant: selectedTenantId(req) }).sort({ paidAt: -1 }).limit(300));
   } catch (error) {
     next(error);
   }
@@ -62,7 +71,8 @@ router.get("/payments", async (req, res, next) => {
 
 router.get("/meter-readings", async (req, res, next) => {
   try {
-    const tenant = await Tenant.findById(req.user.tenant).select("room");
+    const tenant = await Tenant.findById(selectedTenantId(req)).select("room");
+    if (!tenant) return res.status(404).json({ message: "Tenant profile not found" });
     res.json(await MeterReading.find({ room: tenant.room }).sort({ readAt: -1 }).limit(300).populate("room", "name"));
   } catch (error) {
     next(error);
@@ -71,7 +81,7 @@ router.get("/meter-readings", async (req, res, next) => {
 
 router.get("/audit-logs", async (req, res, next) => {
   try {
-    res.json(await AuditLog.find({ tenant: req.user.tenant }).sort({ createdAt: -1 }).limit(300).populate("actor", "name"));
+    res.json(await AuditLog.find({ tenant: selectedTenantId(req) }).sort({ createdAt: -1 }).limit(300).populate("actor", "name"));
   } catch (error) {
     next(error);
   }
@@ -79,7 +89,7 @@ router.get("/audit-logs", async (req, res, next) => {
 
 router.get("/notifications", async (req, res, next) => {
   try {
-    res.json(await Notification.find({ tenant: req.user.tenant }).sort({ createdAt: -1 }).limit(100));
+    res.json(await Notification.find({ tenant: selectedTenantId(req) }).sort({ createdAt: -1 }).limit(100));
   } catch (error) {
     next(error);
   }
@@ -88,7 +98,7 @@ router.get("/notifications", async (req, res, next) => {
 router.patch("/notifications/:id/read", async (req, res, next) => {
   try {
     const notification = await Notification.findOneAndUpdate(
-      { _id: req.params.id, tenant: req.user.tenant },
+      { _id: req.params.id, tenant: selectedTenantId(req) },
       { readAt: new Date() },
       { new: true },
     );

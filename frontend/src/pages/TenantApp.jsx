@@ -17,16 +17,19 @@ const dateTime = new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeSty
 const dateOnly = new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeZone: 'Asia/Kolkata' })
 
 export default function TenantApp({ user, theme, setTheme, onLogout }) {
+  const profiles = user.tenants?.length ? user.tenants : user.tenant ? [user.tenant] : []
   const [page, setPage] = useState('overview')
+  const [selectedTenant, setSelectedTenant] = useState(user.tenant?._id || profiles[0]?._id || '')
   const [data, setData] = useState({ dashboard: null, ledger: [], payments: [], readings: [], logs: [], notifications: [] })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  async function refresh() {
+  async function refresh(tenantId = selectedTenant) {
     setError('')
     try {
+      const query = `?tenant=${encodeURIComponent(tenantId)}`
       const [dashboard, ledger, payments, readings, logs, notifications] = await Promise.all([
-        api('/tenant/dashboard'), api('/tenant/ledger'), api('/tenant/payments'), api('/tenant/meter-readings'), api('/tenant/audit-logs'), api('/tenant/notifications'),
+        api(`/tenant/dashboard${query}`), api(`/tenant/ledger${query}`), api(`/tenant/payments${query}`), api(`/tenant/meter-readings${query}`), api(`/tenant/audit-logs${query}`), api(`/tenant/notifications${query}`),
       ])
       setData({ dashboard, ledger, payments, readings, logs, notifications })
     } catch (err) {
@@ -37,20 +40,27 @@ export default function TenantApp({ user, theme, setTheme, onLogout }) {
   }
 
   useEffect(() => {
-    const timer = setTimeout(refresh, 0)
+    const timer = setTimeout(() => refresh(selectedTenant), 0)
     return () => clearTimeout(timer)
-  }, [])
+  }, [selectedTenant])
+
+  function changeProfile(tenantId) {
+    if (tenantId === selectedTenant) return
+    setSelectedTenant(tenantId)
+    setLoading(true)
+  }
 
   async function readNotification(id) {
     try {
-      await api(`/tenant/notifications/${id}/read`, { method: 'PATCH' })
+      await api(`/tenant/notifications/${id}/read?tenant=${encodeURIComponent(selectedTenant)}`, { method: 'PATCH' })
       setData((current) => ({ ...current, notifications: current.notifications.map((item) => item._id === id ? { ...item, readAt: new Date().toISOString() } : item) }))
     } catch (err) { setError(err.message) }
   }
 
   const unread = data.notifications.filter((item) => !item.readAt).length
   return <Shell user={user} nav={nav} page={page} setPage={setPage} theme={theme} setTheme={setTheme} onLogout={onLogout} badge={unread}>
-    {error && <div className="page-error">{error}<button onClick={refresh}>Try again</button></div>}
+    {profiles.length > 1 && <section className="profile-switcher" aria-label="Choose tenant profile"><div><span className="eyebrow">LEFT ROOM ACCOUNT</span><strong>Viewing as {profiles.find((profile) => profile._id === selectedTenant)?.name}</strong></div><div role="tablist">{profiles.map((profile) => <button type="button" role="tab" aria-selected={profile._id === selectedTenant} className={profile._id === selectedTenant ? 'active' : ''} key={profile._id} onClick={() => changeProfile(profile._id)}>{profile.name}</button>)}</div></section>}
+    {error && <div className="page-error">{error}<button onClick={() => refresh(selectedTenant)}>Try again</button></div>}
     {loading ? <div className="loading-grid"><div /><div /><div /><div /></div> : <>
       {page === 'overview' && <Overview data={data.dashboard} setPage={setPage} />}
       {page === 'ledger' && <TenantLedger entries={data.ledger} dashboard={data.dashboard} />}

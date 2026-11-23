@@ -7,6 +7,8 @@ const authRoutes = require("./routes/auth");
 const systemRoutes = require("./routes/system");
 const adminRoutes = require("./routes/admin");
 const tenantRoutes = require("./routes/tenant");
+const { startDailyBillingScheduler } = require("./services/scheduler");
+const { prepareIndexes } = require("./services/indexes");
 
 const app = express();
 const origins = String(process.env.CLIENT_ORIGIN || "http://localhost:5173")
@@ -28,6 +30,7 @@ app.use(express.json({ limit: "100kb" }));
 app.get("/", (_req, res) => res.json({ name: "Homely Tenants API", status: "running" }));
 app.use("/api/auth", authRoutes);
 app.use("/api/system", systemRoutes);
+app.use("/", systemRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/tenant", tenantRoutes);
 
@@ -48,10 +51,13 @@ async function start() {
   for (const key of ["MONGO_URI", "JWT_SECRET", "CRON_SECRET"]) {
     if (!process.env[key]) throw new Error(`${key} is required. Add it to backend/.env.`);
   }
-  await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 15000 });
+  await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 15000, autoIndex: false });
+  await prepareIndexes();
+  const billingTask = startDailyBillingScheduler();
   const port = Number(process.env.PORT) || 5000;
   const server = app.listen(port, "0.0.0.0", () => console.log(`Homely Tenants API running on port ${port}`));
   process.on("SIGTERM", async () => {
+    billingTask.destroy();
     server.close();
     await mongoose.disconnect();
   });
